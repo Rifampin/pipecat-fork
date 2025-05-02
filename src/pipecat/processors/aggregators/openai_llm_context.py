@@ -176,9 +176,46 @@ class OpenAILLMContext:
         )
         self.add_message({"role": "user", "content": content})
 
-    def add_audio_frames_message(self, *, audio_frames: list[AudioRawFrame], text: str = None):
-        # todo: implement for OpenAI models and others
-        pass
+#implement audiio frames
+    def add_audio_frames_message(self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"):
+        """
+        Add audio frames to the context as a user message.
+        
+        Args:
+            audio_frames: List of AudioRawFrame objects to include in the message
+            text: Optional text to accompany the audio
+        """
+        if not audio_frames:
+            return
+
+        # Get sample rate and channels from first frame
+        sample_rate = audio_frames[0].sample_rate
+        num_channels = audio_frames[0].num_channels
+        
+        # Concatenate all audio data
+        audio_data = b"".join(frame.audio for frame in audio_frames)
+        
+        # Create WAV header for the audio
+        wav_header = self.create_wav_header(sample_rate, num_channels, 16, len(audio_data))
+        complete_wav = bytes(wav_header) + audio_data
+        
+        # Encode as base64
+        encoded_audio = base64.b64encode(complete_wav).decode("utf-8")
+        
+        # Create content structure
+        content = []
+        if text:
+            content.append({"type": "text", "text": text})
+        
+        # Add audio content
+        # Note: OpenAI doesn't officially support audio in chat messages yet, so we're 
+        # using the same approach as for images but with audio mime type
+        content.append(
+            {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{encoded_audio}"}}
+        )
+        
+        # Add to messages
+        self.add_message({"role": "user", "content": content})
 
     def create_wav_header(self, sample_rate, num_channels, bits_per_sample, data_size):
         # RIFF chunk descriptor
