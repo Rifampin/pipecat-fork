@@ -259,14 +259,14 @@ class GoogleLLMContext(OpenAILLMContext):
     def from_standard_message(self, message):
         """Convert standard format message to Google Content object.
 
-        Handles conversion of text, images, audio, and function calls to Google's format.
+        Handles conversion of text, images, and function calls to Google's format.
         System messages are stored separately and return None.
 
         Args:
             message: Message in standard format:
                 {
                     "role": "user/assistant/system/tool",
-                    "content": str | [{"type": "text/image_url/audio_url", ...}] | None,
+                    "content": str | [{"type": "text/image_url", ...}] | None,
                     "tool_calls": [{"function": {"name": str, "arguments": str}}]
                 }
 
@@ -320,16 +320,6 @@ class GoogleLLMContext(OpenAILLMContext):
                             )
                         )
                     )
-                elif c["type"] == "audio_url":
-                    # Handle audio content conversion
-                    parts.append(
-                        glm.Part(
-                            inline_data=glm.Blob(
-                                mime_type="audio/wav",
-                                data=base64.b64decode(c["audio_url"]["url"].split(",")[1]),
-                            )
-                        )
-                    )
 
         message = glm.Content(role=role, parts=parts)
         return message
@@ -337,7 +327,7 @@ class GoogleLLMContext(OpenAILLMContext):
     def to_standard_messages(self, obj) -> list:
         """Convert Google Content object to standard structured format.
 
-        Handles text, images, audio, and function calls from Google's Content/Part objects.
+        Handles text, images, and function calls from Google's Content/Part objects.
 
         Args:
             obj: Google Content object with:
@@ -351,8 +341,7 @@ class GoogleLLMContext(OpenAILLMContext):
                     "role": "user/assistant/tool",
                     "content": [
                         {"type": "text", "text": str} |
-                        {"type": "image_url", "image_url": {"url": str}} |
-                        {"type": "audio_url", "audio_url": {"url": str}}
+                        {"type": "image_url", "image_url": {"url": str}}
                     ]
                 }
             ]
@@ -365,23 +354,13 @@ class GoogleLLMContext(OpenAILLMContext):
             if part.text:
                 msg["content"].append({"type": "text", "text": part.text})
             elif part.inline_data:
-                mime_type = part.inline_data.mime_type
                 encoded = base64.b64encode(part.inline_data.data).decode("utf-8")
-                
-                if mime_type.startswith("image/"):
-                    msg["content"].append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        }
-                    )
-                elif mime_type.startswith("audio/"):
-                    msg["content"].append(
-                        {
-                            "type": "audio_url",
-                            "audio_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        }
-                    )
+                msg["content"].append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{part.inline_data.mime_type};base64,{encoded}"},
+                    }
+                )
             elif part.function_call:
                 args = type(part.function_call).to_dict(part.function_call).get("args", {})
                 msg["tool_calls"] = [
@@ -460,7 +439,6 @@ class GoogleLLMContext(OpenAILLMContext):
 
         # Remove any empty messages
         self._messages = [m for m in self._messages if m.parts]
-
 
 
 class GoogleLLMService(LLMService):
