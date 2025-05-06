@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added support to `RimeHttpTTSService` for the `arcana` model.
+
+### Fixed
+
+- Fixed a `PipelineTask` issue that would cause tasks to not be cancelled if
+  task was cancelled from outside of Pipecat.
+
+- Fixed a `TaskManager` that was causing dangling tasks to be reported.
+
+- Fixed an issue that could cause data to be sent to the transports when they
+  were still not ready.
+
+- Remove custom audio tracks from `DailyTransport` before leaving.
+
+## [0.0.66] - 2025-05-02
+
+### Added
+
+- Added two new input parameters to `RimeTTSService`: `pause_between_brackets`
+  and `phonemize_between_brackets`.
+
+- Added support for cross-platform local smart turn detection. You can use
+  `LocalSmartTurnAnalyzer` for on-device inference using Torch.
+
 - `BaseOutputTransport` now allows multiple destinations if the transport
   implementation supports it (e.g. Daily's custom tracks). With multiple
   destinations it is possible to send different audio or video tracks with a
@@ -113,6 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case there's no need to push audio to the rest of the pipeline, but this is
   not a very common case.
 
+- Added `RivaSegmentedSTTService`, which allows Riva offline/batch models, such
+  as to be "canary-1b-asr" used in Pipecat.
+
 ### Deprecated
 
 - Function calls with parameters
@@ -128,7 +155,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TransportParams.vad_audio_passthrough` parameter is now deprecated, use
   `TransportParams.audio_in_passthrough` instead.
 
+- `ParakeetSTTService` is now deprecated, use `RivaSTTService` instead, which uses
+  the model "parakeet-ctc-1.1b-asr" by default.
+
+- `FastPitchTTSService` is now deprecated, use `RivaTTSService` instead, which uses
+  the model "magpie-tts-multilingual" by default.
+
 ### Fixed
+
+- Fixed an issue with `SimliVideoService` where the bot was continuously outputting
+  audio, which prevents the `BotStoppedSpeakingFrame` from being emitted.
 
 - Fixed an issue where `OpenAIRealtimeBetaLLMService` would add two assistant
   messages to the context.

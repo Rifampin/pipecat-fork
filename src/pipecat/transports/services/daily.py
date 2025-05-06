@@ -11,14 +11,6 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 import aiohttp
-from daily import (
-    AudioData,
-    CustomAudioSource,
-    VideoFrame,
-    VirtualCameraDevice,
-    VirtualMicrophoneDevice,
-    VirtualSpeakerDevice,
-)
 from loguru import logger
 from pydantic import BaseModel
 
@@ -50,7 +42,17 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.utils.asyncio import BaseTaskManager
 
 try:
-    from daily import CallClient, Daily, EventHandler
+    from daily import (
+        AudioData,
+        CallClient,
+        CustomAudioSource,
+        Daily,
+        EventHandler,
+        VideoFrame,
+        VirtualCameraDevice,
+        VirtualMicrophoneDevice,
+        VirtualSpeakerDevice,
+    )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -576,6 +578,10 @@ class DailyTransportClient(EventHandler):
         if self._params.transcription_enabled:
             await self._stop_transcription()
 
+        # Remove any custom tracks, if any.
+        for track_name, _ in self._audio_sources.items():
+            await self.remove_custom_audio_track(track_name)
+
         try:
             error = await self._leave()
             if not error:
@@ -738,6 +744,14 @@ class DailyTransportClient(EventHandler):
         await future
 
         return audio_source
+
+    async def remove_custom_audio_track(self, track_name: str):
+        future = self._get_event_loop().create_future()
+        self._client.remove_custom_audio_track(
+            track_name=track_name,
+            completion=completion_callback(future),
+        )
+        await future
 
     async def update_transcription(self, participants=None, instance_id=None):
         future = self._get_event_loop().create_future()
@@ -930,19 +944,23 @@ class DailyInputTransport(BaseInputTransport):
             self._audio_in_task = self.create_task(self._audio_in_task_handler())
 
     async def start(self, frame: StartFrame):
-        # Setup client.
-        await self._client.setup(frame)
-
-        # Parent start.
-        await super().start(frame)
-
         if self._initialized:
             return
 
         self._initialized = True
 
+        # Parent start.
+        await super().start(frame)
+
+        # Setup client.
+        await self._client.setup(frame)
+
         # Join the room.
         await self._client.join()
+
+        # Indicate the transport that we are connected.
+        await self.set_transport_ready(frame)
+
         if self._params.audio_in_stream_on_start:
             self.start_audio_in_streaming()
 
@@ -1111,19 +1129,22 @@ class DailyOutputTransport(BaseOutputTransport):
         self._initialized = False
 
     async def start(self, frame: StartFrame):
-        # Setup client.
-        await self._client.setup(frame)
-
-        # Parent start.
-        await super().start(frame)
-
         if self._initialized:
             return
 
         self._initialized = True
 
+        # Parent start.
+        await super().start(frame)
+
+        # Setup client.
+        await self._client.setup(frame)
+
         # Join the room.
         await self._client.join()
+
+        # Indicate the transport that we are connected.
+        await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
         # Parent stop.
