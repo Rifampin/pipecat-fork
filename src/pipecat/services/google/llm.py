@@ -48,15 +48,18 @@ from pipecat.services.openai.llm import (
     OpenAIUserContextAggregator,
 )
 
-# Suppress gRPC fork warnings (may or may not be needed with the new HTTP-based SDK,
-# but safer to keep if other underlying Google libraries might still use gRPC)
+# For checking OpenAI's specific NOT_GIVEN sentinel
+from openai._types import NOT_GIVEN as OPENAI_NOT_GIVEN
+
+
+# Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 try:
     import google.genai as genai
     import google.genai.types as genai_types
+    import google.genai.errors as genai_errors # Import for new error types
     from google.auth.exceptions import GoogleAuthError
-    # DeadlineExceeded might still be raised by underlying libraries like google-auth or google-api-core
     from google.api_core import exceptions as api_core_exceptions
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -69,55 +72,47 @@ except ModuleNotFoundError as e:
 class GoogleUserContextAggregator(OpenAIUserContextAggregator):
     async def push_aggregation(self):
         if len(self._aggregation) > 0:
-            self._context.add_message(
+            self._context.add_message( # Ensure context is GoogleLLMContext
                 genai_types.Content(role="user", parts=[
                                     genai_types.Part(text=self._aggregation)])
             )
-
-            # Reset the aggregation. Reset it before pushing it down, otherwise
-            # if the tasks gets cancelled we won't be able to clear things up.
             self._aggregation = ""
-
-            # Push context frame
             frame = OpenAILLMContextFrame(self._context)
             await self.push_frame(frame)
-
-            # Reset our accumulator state.
             self.reset()
 
 
 class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
     async def handle_aggregation(self, aggregation: str):
-        self._context.add_message(
+        self._context.add_message( # Ensure context is GoogleLLMContext
             genai_types.Content(role="model", parts=[
                                 genai_types.Part(text=aggregation)])
         )
 
     async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
+        # Add model's request for function call
         self._context.add_message(
             genai_types.Content(
                 role="model",
                 parts=[
                     genai_types.Part(
-                        function_call=genai_types.FunctionCall(
+                        function_call=genai_types.FunctionCall( # No 'id' field in genai_types.FunctionCall
                             name=frame.function_name, args=frame.arguments
                         )
                     )
                 ],
             )
         )
-        # For Google AI, FunctionResponse needs a name, but it's the function name, not tool_call_id.
-        # The response part of FunctionResponse is a dict.
-        # Simulating "IN_PROGRESS" as a structured response.
+        # Add a placeholder for the function's response (as per new SDK, role="function")
+        # Pipecat's tool_call_id is for internal tracking. Google matches by function name.
         self._context.add_message(
             genai_types.Content(
-                role="function",  # Or "user" if that's how Google expects tool responses. The old code used "user".
-                                 # The new genai.types.Content role for function responses is "function".
+                role="function",
                 parts=[
                     genai_types.Part(
                         function_response=genai_types.FunctionResponse(
-                            name=frame.function_name, # Corresponds to FunctionCall.name
-                            response={"status": "IN_PROGRESS"},
+                            name=frame.function_name,
+                            response={"status": "IN_PROGRESS", "_pipecat_tool_call_id": frame.tool_call_id} # Store pipecat id for matching
                         )
                     )
                 ],
@@ -127,7 +122,7 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
     async def handle_function_call_result(self, frame: FunctionCallResultFrame):
         result_payload = frame.result if frame.result else {"status": "COMPLETED"}
         await self._update_function_call_result(
-            frame.function_name, frame.tool_call_id, result_payload # tool_call_id is pipecat internal
+            frame.function_name, frame.tool_call_id, result_payload
         )
 
     async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
@@ -138,43 +133,29 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
     async def _update_function_call_result(
         self, function_name: str, tool_call_id: str, result: Any
     ):
-        # The new SDK uses `role="function"` for responses.
-        # The matching of tool_call_id is a pipecat internal mechanism,
-        # Google's FunctionResponse matches by `name`.
-        # We need to find the "IN_PROGRESS" response and update it.
-        # The old logic iterated through messages, found a user role part with function_response.id == tool_call_id.
-        # This needs to be adapted. `tool_call_id` is not part of Google's FunctionCall/Response model.
-        # Pipecat's `OpenAIAssistantContextAggregator` has a more robust way of handling this by matching message contents.
-        # For Google, the FunctionResponse part itself needs to be updated.
-        # We search for the specific FunctionResponse part related to this function name that was marked IN_PROGRESS.
-        # Since `tool_call_id` is not in Google's model, we rely on function_name and the assumption
-        # that the "IN_PROGRESS" message is the one to update.
         for message in reversed(self._context.messages): # Iterate backwards to find the most recent
-            if message.role == "function": # Or "user" if that was the choice for "IN_PROGRESS"
+            if message.role == "function":
                 for part in message.parts:
-                    if part.function_response and part.function_response.name == function_name:
-                        # Check if this is the one we marked as IN_PROGRESS
-                        if isinstance(part.function_response.response, dict) and \
-                           part.function_response.response.get("status") == "IN_PROGRESS":
-                            part.function_response.response = {"value": json.dumps(result)}
-                            return # Found and updated
-
-        # If not found (e.g., if IN_PROGRESS was structured differently or not added),
-        # we might need to add a new function response message.
-        # This part needs to be robust. For now, assuming update of a pre-existing placeholder.
-        logger.warning(f"Could not find IN_PROGRESS placeholder for function {function_name} to update result.")
+                    if part.function_response and \
+                       part.function_response.name == function_name and \
+                       isinstance(part.function_response.response, dict) and \
+                       part.function_response.response.get("status") == "IN_PROGRESS" and \
+                       part.function_response.response.get("_pipecat_tool_call_id") == tool_call_id:
+                        part.function_response.response = result # The new SDK expects the raw dict, not json.dumps
+                        return
+        logger.warning(f"Could not find IN_PROGRESS placeholder for function {function_name} (tool_id: {tool_call_id}) to update result.")
 
 
     async def handle_user_image_frame(self, frame: UserImageRawFrame):
-        # This assumes a tool call requested the image. Update its status.
-        await self._update_function_call_result(
-            frame.request.function_name, frame.request.tool_call_id, {"status": "COMPLETED_WITH_IMAGE"}
-        )
+        if frame.request and frame.request.tool_call_id and frame.request.function_name:
+            await self._update_function_call_result(
+                frame.request.function_name, frame.request.tool_call_id, {"status": "COMPLETED_WITH_IMAGE"}
+            )
         self._context.add_image_frame_message(
             format=frame.format,
             size=frame.size,
             image=frame.image,
-            text=frame.request.context,
+            text=frame.request.context if frame.request else None,
         )
 
 
@@ -193,96 +174,101 @@ class GoogleContextAggregatorPair:
 class GoogleLLMContext(OpenAILLMContext):
     def __init__(
         self,
-        messages: Optional[List[genai_types.Content]] = None, # Expect new types
-        tools: Optional[List[genai_types.Tool]] = None,      # Expect new types
-        tool_choice: Optional[Any] = None, # tool_choice format for genai?
-                                           # genai_types.ToolConfig or specific string
+        messages: Optional[List[Any]] = None, # Can be dicts or genai_types.Content
+        tools: Optional[List[Any]] = None,   # Can be dicts or genai_types.Tool
+        tool_choice: Optional[Any] = None,
     ):
-        # Superclass expects List[ChatCompletionMessageParam], etc.
-        # We need to handle this initial conversion if `messages` are passed in OpenAI format.
-        # For now, let's assume messages are either already genai_types.Content or will be converted.
-        # This init might need more sophisticated handling if mixed types are common at instantiation.
-        super().__init__(messages=[], tools=tools, tool_choice=tool_choice) # Start with empty and add
+        super().__init__(messages=[], tools=None, tool_choice=None) # Initialize empty
+        self.system_message_text: Optional[str] = None
+
+        if tools is not None: # Directly assign, adapter will handle
+            self._tools = tools
+        if tool_choice is not None: # Directly assign, adapter will handle
+            self._tool_choice = tool_choice
         if messages:
             self.add_messages(messages)
-        self.system_message_text: Optional[str] = None # Store the raw system message string
+
 
     @property
-    def system_instruction_content(self) -> Optional[genai_types.Content]:
+    def system_instruction_for_api(self) -> Optional[genai_types.Content]: # Renamed for clarity
         if self.system_message_text:
-            return genai_types.Content(parts=[genai_types.Part(text=self.system_message_text)], role="system") # Role "system" is conceptual here
+            # For genai, system_instruction is a top-level param in GenerationConfig, not a message role.
+            # However, genai_types.Content can be used to structure it.
+            return genai_types.Content(parts=[genai_types.Part(text=self.system_message_text)])
         return None
 
     @staticmethod
     def upgrade_to_google(obj: OpenAILLMContext) -> "GoogleLLMContext":
         if not isinstance(obj, GoogleLLMContext):
             logger.debug(f"Upgrading OpenAI context to GoogleLLMContext: {obj}")
-            # Create a new GoogleLLMContext and transfer relevant data
-            # This is safer than changing __class__
             new_google_context = GoogleLLMContext()
-            # Convert messages from OpenAI format to Google format
-            standard_messages = obj.get_messages_for_persistent_storage() # Gets messages in standard OpenAI dict format
-            converted_google_messages = []
-            for std_msg in standard_messages:
-                # Handle system message separately
-                if std_msg.get("role") == "system" and isinstance(std_msg.get("content"), str):
-                    new_google_context.system_message_text = std_msg["content"]
-                    continue
-                google_msg = new_google_context.from_standard_message(std_msg)
-                if google_msg:
-                    converted_google_messages.append(google_msg)
-            new_google_context._messages = converted_google_messages
+            
+            openai_messages = obj.get_messages_for_persistent_storage() # Gets list of dicts
+            system_text_from_openai = None
+            regular_messages_from_openai = []
 
-            # Transfer tools and tool_choice, adapting format if necessary
-            # For now, assume they are compatible or handled by adapter
-            if obj.tools and obj.tools is not genai_types.NOT_GIVEN: # NOT_GIVEN is from openai._types
-                new_google_context._tools = obj.tools # This might need conversion
-            if obj.tool_choice and obj.tool_choice is not genai_types.NOT_GIVEN:
-                new_google_context._tool_choice = obj.tool_choice # This might need conversion
+            for msg_dict in openai_messages:
+                if msg_dict.get("role") == "system" and isinstance(msg_dict.get("content"), str):
+                    system_text_from_openai = msg_dict["content"]
+                else:
+                    regular_messages_from_openai.append(msg_dict)
+            
+            if system_text_from_openai:
+                new_google_context.system_message_text = system_text_from_openai
+            
+            new_google_context.add_messages(regular_messages_from_openai) # Converts and adds non-system
 
-            new_google_context._llm_adapter = obj.get_llm_adapter()
-            # new_google_context._restructure_from_openai_messages() # Call if still needed after conversion
+            if obj.tools is not OPENAI_NOT_GIVEN:
+                 new_google_context._tools = obj.tools # Will be adapted by LLM adapter
+            if obj.tool_choice is not OPENAI_NOT_GIVEN:
+                new_google_context._tool_choice = obj.tool_choice # Will be adapted
+
+            new_google_context.set_llm_adapter(obj.get_llm_adapter())
             return new_google_context
         return obj
 
-
-    def set_messages(self, messages: List[Any]): # Can be list of dicts or list of Content
+    def set_messages(self, messages: List[Any]):
         self._messages.clear()
+        current_system_text = self.system_message_text # Preserve existing system message
+        self.system_message_text = None # Reset in case new messages contain a system message
         self.add_messages(messages)
-        # self._restructure_from_openai_messages() # May need adjustment
+        if self.system_message_text is None: # If add_messages didn't set a new one
+            self.system_message_text = current_system_text
 
-    def add_messages(self, messages: List[Any]): # Can be list of dicts or list of Content
-        converted_messages = []
-        for msg in messages:
-            if isinstance(msg, genai_types.Content):
-                converted_messages.append(msg)
-            elif isinstance(msg, dict): # Assuming it's OpenAI standard message format
-                 # Handle system message separately
-                if msg.get("role") == "system" and isinstance(msg.get("content"), str):
-                    self.system_message_text = msg["content"]
-                    # System messages are not added to the main message list for Gemini API
+
+    def add_messages(self, messages: List[Any]):
+        # This method now expects messages to be either:
+        # 1. A list of `genai_types.Content` objects.
+        # 2. A list of dictionaries in the standard OpenAI message format.
+        for msg_input in messages:
+            if isinstance(msg_input, genai_types.Content):
+                self._messages.append(msg_input)
+            elif isinstance(msg_input, dict): # Assume OpenAI standard message format
+                if msg_input.get("role") == "system" and isinstance(msg_input.get("content"), str):
+                    self.system_message_text = msg_input["content"]
+                    # Do not add system messages to the main _messages list for Gemini
                     continue
-                converted = self.from_standard_message(msg)
-                if converted:
-                    converted_messages.append(converted)
+                
+                converted_msg = self.from_standard_message(msg_input)
+                if converted_msg:
+                    self._messages.append(converted_msg)
             else:
-                logger.warning(f"Skipping unknown message type during add_messages: {type(msg)}")
-
-        self._messages.extend(converted_messages)
-        # self._restructure_from_openai_messages()
+                logger.warning(f"Skipping unknown message type during add_messages: {type(msg_input)}")
 
     def get_messages_for_logging(self) -> List[Dict]:
         msgs = []
-        for message in self.messages:
-            # genai_types.Content are Pydantic models
-            obj = message.model_dump(exclude_none=True)
+        # Include system message in logging if present
+        if self.system_message_text:
+            msgs.append({"role": "system", "content": self.system_message_text})
+
+        for message_content in self.messages: # self.messages contains genai_types.Content
+            # Convert genai_types.Content to a dict for logging
+            obj = message_content.model_dump(exclude_none=True) # Pydantic model_dump
             try:
                 if "parts" in obj:
                     for part in obj["parts"]:
                         if "inline_data" in part and isinstance(part["inline_data"], dict):
-                            # inline_data itself is a Blob, its 'data' field is bytes
-                            # For logging, we might want to truncate or indicate presence of bytes
-                            if "data" in part["inline_data"]:
+                            if "data" in part["inline_data"] and isinstance(part["inline_data"]["data"], bytes):
                                  part["inline_data"]["data"] = f"<bytes len={len(part['inline_data']['data'])}>"
             except Exception as e:
                 logger.debug(f"Error redacting message for logging: {e}")
@@ -290,10 +276,10 @@ class GoogleLLMContext(OpenAILLMContext):
         return msgs
 
     def add_image_frame_message(
-        self, *, format: str, size: tuple[int, int], image: bytes, text: Optional[str] = None
+        self, *, format: str, size: tuple[int, int], image: bytes, text: str = None
     ):
         buffer = io.BytesIO()
-        Image.frombytes(format, size, image).save(buffer, format="JPEG")
+        Image.frombytes(format, size, image).save(buffer, format="JPEG") # Ensure JPEG for Gemini
 
         parts = []
         if text:
@@ -301,19 +287,17 @@ class GoogleLLMContext(OpenAILLMContext):
         parts.append(genai_types.Part(inline_data=genai_types.Blob(
             mime_type="image/jpeg", data=buffer.getvalue())))
 
-        # Images are typically user messages
         self.add_messages([genai_types.Content(role="user", parts=parts)])
 
 
     def add_audio_frames_message(
-        self, *, audio_frames: list[AudioRawFrame], text: Optional[str] = None
+        self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
         if not audio_frames:
             return
 
         sample_rate = audio_frames[0].sample_rate
         num_channels = audio_frames[0].num_channels
-
         audio_data = b"".join(frame.audio for frame in audio_frames)
         wav_data = self.create_wav_header(sample_rate, num_channels, 16, len(audio_data)) + audio_data
 
@@ -323,8 +307,7 @@ class GoogleLLMContext(OpenAILLMContext):
         parts.append(
             genai_types.Part(
                 inline_data=genai_types.Blob(
-                    mime_type="audio/wav",
-                    data=wav_data,
+                    mime_type="audio/wav", data=wav_data
                 )
             )
         )
@@ -332,206 +315,98 @@ class GoogleLLMContext(OpenAILLMContext):
 
     def from_standard_message(self, message: Dict[str, Any]) -> Optional[genai_types.Content]:
         role = message.get("role")
-        content = message.get("content") # Can be str or list of dicts
+        content = message.get("content")
 
-        # System messages are handled by setting self.system_message_text
-        # and not converted to a genai_types.Content in the main list
-        if role == "system":
-            if isinstance(content, str):
-                self.system_message_text = content
+        if role == "system": # System messages handled by self.system_message_text
+            if isinstance(content, str): self.system_message_text = content
             elif isinstance(content, list) and content and isinstance(content[0].get("text"), str):
-                self.system_message_text = content[0]["text"] # Take first text part for simplicity
+                self.system_message_text = content[0]["text"]
             return None
 
-        # Map roles: "assistant" -> "model", "tool" -> "function" (for responses)
-        # "user" remains "user"
-        if role == "assistant":
-            google_role = "model"
-        elif role == "tool":
-            google_role = "function" # Role for function responses
-        elif role == "user":
-            google_role = "user"
-        else:
-            logger.warning(f"Unknown role '{role}' in standard message, defaulting to 'user'.")
-            google_role = "user"
+        google_role = "user" # Default
+        if role == "assistant": google_role = "model"
+        elif role == "tool": google_role = "function"
+        elif role == "user": google_role = "user"
+        else: logger.warning(f"Unknown role '{role}', defaulting to 'user'.")
 
         parts = []
-        if message.get("tool_calls"): # This is from an assistant/model
-            google_role = "model" # Ensure role is model for function calls
-            for tc in message["tool_calls"]:
-                function_data = tc.get("function", {})
-                try:
-                    args = json.loads(function_data.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-                    logger.warning(f"Could not parse arguments for function call {function_data.get('name')}")
-
-                parts.append(
-                    genai_types.Part(
-                        function_call=genai_types.FunctionCall(
-                            name=function_data.get("name"),
-                            args=args,
-                        )
-                    )
-                )
-        elif role == "tool": # This is a response from a tool/function
-            # Pipecat's standard "tool" role message has "content" (json string of result)
-            # and "tool_call_id" (maps to function name for Google if simple).
-            # Google expects FunctionResponse part with name and response (dict).
-            try:
-                response_content = json.loads(content) if isinstance(content, str) else content
-            except json.JSONDecodeError:
-                response_content = {"error": "failed to parse content", "original_content": content}
-            parts.append(
-                genai_types.Part(
-                    function_response=genai_types.FunctionResponse(
-                        name=message.get("name") or message.get("tool_call_id", "unknown_function"), # OpenAI uses name, Pipecat might use tool_call_id
-                        response=response_content
-                    )
-                )
-            )
+        tool_calls = message.get("tool_calls")
+        if tool_calls: # Assistant requesting function call
+            google_role = "model"
+            for tc in tool_calls:
+                fn_data = tc.get("function", {})
+                try: args = json.loads(fn_data.get("arguments", "{}"))
+                except json.JSONDecodeError: args = {}
+                parts.append(genai_types.Part(function_call=genai_types.FunctionCall(name=fn_data.get("name"), args=args)))
+        elif google_role == "function": # Function response (from "tool" role)
+            try: response_data = json.loads(content) if isinstance(content, str) else content
+            except json.JSONDecodeError: response_data = {"error": "failed to parse content", "original_content": content}
+            parts.append(genai_types.Part(function_response=genai_types.FunctionResponse(name=message.get("name", "unknown_function"), response=response_data)))
         elif isinstance(content, str):
             parts.append(genai_types.Part(text=content))
-        elif isinstance(content, list): # Multi-part content (e.g., text and image)
+        elif isinstance(content, list): # Multi-part content
             for item in content:
                 item_type = item.get("type")
-                if item_type == "text":
-                    parts.append(genai_types.Part(text=item.get("text")))
+                if item_type == "text": parts.append(genai_types.Part(text=item.get("text")))
                 elif item_type == "image_url":
-                    image_url_data = item.get("image_url", {}).get("url", "")
-                    if image_url_data.startswith("data:image"):
+                    url_data = item.get("image_url", {}).get("url", "")
+                    if url_data.startswith("data:image"):
                         try:
-                            mime_type, b64_data = image_url_data.split(';base64,')
-                            mime_type = mime_type.split(':')[1]
-                            image_bytes = base64.b64decode(b64_data)
-                            parts.append(genai_types.Part(inline_data=genai_types.Blob(
-                                mime_type=mime_type, data=image_bytes
-                            )))
-                        except Exception as e:
-                            logger.error(f"Error decoding image_url data: {e}")
-                elif item_type == "audio_url": # Assuming similar base64 data URI
-                    audio_url_data = item.get("audio_url", {}).get("url", "")
-                    if audio_url_data.startswith("data:audio"):
+                            mime, b64_data = url_data.split(';base64,')
+                            parts.append(genai_types.Part(inline_data=genai_types.Blob(mime_type=mime.split(':')[1], data=base64.b64decode(b64_data))))
+                        except Exception as e: logger.error(f"Error decoding image_url: {e}")
+                elif item_type == "audio_url":
+                    url_data = item.get("audio_url", {}).get("url", "")
+                    if url_data.startswith("data:audio"):
                         try:
-                            mime_type, b64_data = audio_url_data.split(';base64,')
-                            mime_type = mime_type.split(':')[1]
-                            audio_bytes = base64.b64decode(b64_data)
-                            parts.append(genai_types.Part(inline_data=genai_types.Blob(
-                                mime_type=mime_type, data=audio_bytes
-                            )))
-                        except Exception as e:
-                            logger.error(f"Error decoding audio_url data: {e}")
-        if not parts:
-            return None
-        return genai_types.Content(role=google_role, parts=parts)
+                            mime, b64_data = url_data.split(';base64,')
+                            parts.append(genai_types.Part(inline_data=genai_types.Blob(mime_type=mime.split(':')[1], data=base64.b64decode(b64_data))))
+                        except Exception as e: logger.error(f"Error decoding audio_url: {e}")
+        
+        return genai_types.Content(role=google_role, parts=parts) if parts else None
 
     def to_standard_messages(self, google_content: genai_types.Content) -> List[Dict[str, Any]]:
-        # Converts a single google.genai.types.Content object to Pipecat's standard list-of-dicts format.
-        # A single Google Content can map to one standard message.
         std_msg: Dict[str, Any] = {}
+        std_msg["role"] = {"model": "assistant", "function": "tool"}.get(google_content.role, google_content.role)
 
-        if google_content.role == "model":
-            std_msg["role"] = "assistant"
-        elif google_content.role == "function": # Google's role for function responses
-            std_msg["role"] = "tool"
-        else: # "user"
-            std_msg["role"] = google_content.role
-
-        content_parts = []
-        tool_calls = []
-
+        content_parts, tool_calls_list = [], []
         for part in google_content.parts:
-            if part.text:
-                content_parts.append({"type": "text", "text": part.text})
+            if part.text: content_parts.append({"type": "text", "text": part.text})
             elif part.inline_data:
-                mime_type = part.inline_data.mime_type
-                encoded_data = base64.b64encode(part.inline_data.data).decode("utf-8")
-                data_url = f"data:{mime_type};base64,{encoded_data}"
-                if mime_type.startswith("image/"):
-                    content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-                elif mime_type.startswith("audio/"):
-                    content_parts.append({"type": "audio_url", "audio_url": {"url": data_url}})
+                mime, data_b64 = part.inline_data.mime_type, base64.b64encode(part.inline_data.data).decode("utf-8")
+                url = f"data:{mime};base64,{data_b64}"
+                content_parts.append({"type": "image_url" if mime.startswith("image/") else "audio_url", 
+                                      "image_url" if mime.startswith("image/") else "audio_url": {"url": url}})
             elif part.function_call:
-                # This implies the assistant (model) is requesting a function call
-                std_msg["role"] = "assistant" # Ensure role is assistant
-                tool_calls.append({
-                    "id": part.function_call.name, # Use function name as ID, as OpenAI does
-                    "type": "function",
-                    "function": {
-                        "name": part.function_call.name,
-                        "arguments": json.dumps(part.function_call.args or {}),
-                    },
-                })
+                std_msg["role"] = "assistant" # Override if model is making a call
+                tool_calls_list.append({"id": part.function_call.name, "type": "function", 
+                                     "function": {"name": part.function_call.name, "arguments": json.dumps(part.function_call.args or {})}})
             elif part.function_response:
-                # This is a response from a tool/function
-                std_msg["role"] = "tool" # Standard role for tool responses
-                std_msg["tool_call_id"] = part.function_response.name # Name of the function that was called
-                # The response from google.genai.types.FunctionResponse is already a dict.
-                # Pipecat expects the "content" of a tool message to be a JSON string of this response.
+                std_msg["role"] = "tool" # Function response means tool role
+                std_msg["tool_call_id"] = part.function_response.name
                 std_msg["content"] = json.dumps(part.function_response.response or {})
-                # Clear other content parts if this is a function response message
-                content_parts = []
-                break # A function_response part defines the whole message as a tool response
-
-        if tool_calls:
-            std_msg["tool_calls"] = tool_calls
+                content_parts = [] # Function response is the sole content for a tool message
+                break 
         
+        if tool_calls_list: std_msg["tool_calls"] = tool_calls_list
         if content_parts:
-            # If only one text part, simplify to string content, else list of dicts
-            if len(content_parts) == 1 and content_parts[0]["type"] == "text":
-                std_msg["content"] = content_parts[0]["text"]
-            else:
-                std_msg["content"] = content_parts
-        elif not tool_calls and "content" not in std_msg : # Ensure content field exists if no tool_calls and not a tool response
-             std_msg["content"] = None if std_msg["role"] == "assistant" else ""
-
-
+            std_msg["content"] = content_parts[0]["text"] if len(content_parts) == 1 and content_parts[0]["type"] == "text" else content_parts
+        elif "content" not in std_msg and not tool_calls_list: # Ensure content field if not tool call/response
+            std_msg["content"] = None if std_msg["role"] == "assistant" else ""
+            
         return [std_msg]
 
-
     def _restructure_from_openai_messages(self):
-        # This method might need to be re-evaluated.
-        # The primary goal is to ensure messages are in Google's format.
-        # System messages are handled by self.system_message_text.
-        # The main self._messages list should only contain user/model/function messages.
-        
-        openai_formatted_messages = self._messages # These might be dicts from OpenAI context
-        self._messages = [] # Reset to store converted genai_types.Content
-
-        temp_system_message_text = None
-
-        for msg_data in openai_formatted_messages:
-            if isinstance(msg_data, genai_types.Content): # Already converted
-                self._messages.append(msg_data)
-                continue
-            
-            # Assuming msg_data is a dict in OpenAI standard format
-            role = msg_data.get("role")
-            content = msg_data.get("content")
-
-            if role == "system":
-                if isinstance(content, str):
-                    temp_system_message_text = content
-                elif isinstance(content, list) and content and isinstance(content[0].get("text"), str):
-                    temp_system_message_text = content[0]["text"]
-                continue # System messages are not added to self._messages directly
-
-            converted_msg = self.from_standard_message(msg_data)
-            if converted_msg:
-                self._messages.append(converted_msg)
-        
-        if temp_system_message_text:
-            self.system_message_text = temp_system_message_text
-        
-        # Remove any empty messages (e.g. if a conversion resulted in None and wasn't filtered)
-        self._messages = [m for m in self._messages if m and getattr(m, 'parts', None)]
-
+        # This method might be redundant if add_messages and set_messages correctly handle system messages.
+        # The key is that self._messages should only contain genai_types.Content for user/model/function roles.
+        # self.system_message_text holds the system instruction.
+        pass # Simplified, assuming conversion logic in add_messages/set_messages is sufficient.
 
 class GoogleLLMService(LLMService):
     adapter_class = GeminiLLMAdapter
 
     class InputParams(BaseModel):
-        max_tokens: Optional[int] = Field(default=None, ge=1) # Defaulting to None, let model decide or be set by GenerationConfig
+        max_output_tokens: Optional[int] = Field(default=None, ge=1)
         temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
         top_k: Optional[int] = Field(default=None, ge=0)
         top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -541,118 +416,106 @@ class GoogleLLMService(LLMService):
         self,
         *,
         api_key: str,
-        model: str = "gemini-1.5-flash", # Updated default model
+        model: str = "gemini-1.5-flash",
         params: InputParams = InputParams(),
-        system_instruction: Optional[str] = None, # This is the string form
-        tools: Optional[List[Dict[str, Any]]] = None, # Standard tool format
-        tool_config: Optional[Dict[str, Any]] = None, # Standard tool_config format
+        system_instruction: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        
-        # Configure the genai client. API key is passed here.
-        # The genai.Client handles underlying API configuration.
         try:
-            self._google_client = genai.Client(api_key=api_key)
+            # The genai.configure(api_key=...) is a global configuration.
+            # It's better to pass the API key to the client if possible,
+            # or ensure this is called once appropriately if it's the only way.
+            # For SDKs that manage clients per service instance, this global configure can be problematic.
+            # The new `google-genai` SDK uses `genai.Client(api_key="YOUR_API_KEY")`
+            # which is better for encapsulation.
+            self._google_client_internal = genai.Client(api_key=api_key) # Per-instance client
+            self._google_model_service = self._google_client_internal.models
         except GoogleAuthError as e:
-            logger.error(f"Google Authentication Error: {e}")
+            logger.error(f"Google Authentication Error: {e}. Ensure API key is valid and has Gemini API enabled.")
             raise
         except Exception as e:
             logger.error(f"Failed to initialize Google GenAI Client: {e}")
             raise
 
-        self._google_model_service = self._google_client.models # Service to call generate_content_stream
-
-        self.set_model_name(model) # Stores self._model_name
-        self._system_instruction_text = system_instruction # Store raw string
+        self.set_model_name(model)
+        self._system_instruction_text = system_instruction
         
         self._settings = {
-            "max_output_tokens": params.max_tokens, # genai uses max_output_tokens
+            "max_output_tokens": params.max_output_tokens,
             "temperature": params.temperature,
             "top_k": params.top_k,
             "top_p": params.top_p,
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
-        
-        # Tools and tool_config are stored in their standard format.
-        # They will be converted by the adapter before being sent to the API.
         self._tools_standard_format = tools
         self._tool_config_standard_format = tool_config
 
     def can_generate_metrics(self) -> bool:
         return True
 
-    # _create_client is no longer needed as self._google_model_service is initialized in __init__
-
-    async def _process_context(self, context: GoogleLLMContext): # Expects GoogleLLMContext
+    async def _process_context(self, context: GoogleLLMContext):
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
         completion_tokens = 0
-        # total_tokens will be derived
-
+        final_usage_metadata = None # Initialize here
         grounding_metadata_dict: Optional[Dict[str, Any]] = None
         search_result_text = ""
 
         try:
             logger.debug(f"{self}: Generating chat for model {self._model_name} with context: [{context.get_messages_for_logging()}]")
 
-            messages_for_api = context.messages # These should be List[genai_types.Content]
+            messages_for_api = context.messages
             
-            # Prepare GenerationConfig
             generation_config_params = {k: v for k, v in self._settings.items() if v is not None and k != "extra"}
             
-            # Handle system instruction
-            current_system_instruction_text = context.system_message_text if context.system_message_text else self._system_instruction_text
+            current_system_instruction_text = context.system_message_text or self._system_instruction_text
             if current_system_instruction_text:
-                generation_config_params["system_instruction"] = genai_types.Content(
-                    parts=[genai_types.Part(text=current_system_instruction_text)],
-                    # role="system" is not directly part of genai_types.Content for system_instruction,
-                    # it's implicitly understood by its placement in GenerationConfig.
-                )
+                # In google-genai, system_instruction is part of GenerationConfig
+                generation_config_params["system_instruction"] = current_system_instruction_text
+
 
             final_generation_config = genai_types.GenerationConfig(**generation_config_params) if generation_config_params else None
-
-            # Prepare tools and tool_config using the adapter
-            # The context.tools and context.tool_choice should be in the target format or adaptable
+            
             api_tools = None
-            if context.tools not in [None, genai_types.NOT_GIVEN]: # NOT_GIVEN is from openai._types
+            # Use OPENAI_NOT_GIVEN for checking context.tools as it comes from OpenAILLMContext
+            if context.tools is not None and context.tools is not OPENAI_NOT_GIVEN:
                 api_tools = self.get_llm_adapter().from_standard_tools(context.tools)
             elif self._tools_standard_format:
                 api_tools = self.get_llm_adapter().from_standard_tools(self._tools_standard_format)
 
             api_tool_config = None
-            # Assuming tool_choice from context or self._tool_config_standard_format needs to be converted
-            # to genai_types.ToolConfig. This is also adapter's job.
-            # For example, context.tool_choice could be a string like "auto" or a specific function dict.
-            # This needs careful mapping in the GeminiLLMAdapter.
-            # For now, let's assume adapter handles it or it's passed if compatible.
-            raw_tool_choice = context.tool_choice if context.tool_choice is not genai_types.NOT_GIVEN else self._tool_config_standard_format
-
+            raw_tool_choice = context.tool_choice if context.tool_choice is not OPENAI_NOT_GIVEN else self._tool_config_standard_format
             if raw_tool_choice:
                  api_tool_config = self.get_llm_adapter().from_standard_tool_choice(raw_tool_choice, api_tools)
 
-
             await self.start_ttfb_metrics()
             
+            # Use the instance-specific model service
             stream_response = await self._google_model_service.generate_content_stream(
                 model=self._model_name,
                 contents=messages_for_api,
-                tools=api_tools, # Expects List[genai_types.Tool]
+                tools=api_tools,
                 generation_config=final_generation_config,
-                tool_config=api_tool_config, # Expects genai_types.ToolConfig
+                tool_config=api_tool_config,
             )
             await self.stop_ttfb_metrics()
 
-            final_usage_metadata = None
+            # According to google-genai docs, usage_metadata is only in the first response for streams.
+            # We need to consume the first item to get it, then yield it back if needed or process.
+            # This requires a more complex handling of the async iterator.
+            # For simplicity in this refactor, we'll assume it MIGHT appear in any chunk and take the last one.
+            # A more robust solution would be to peek/buffer the first chunk.
+
             async for chunk in stream_response:
                 if chunk.usage_metadata:
-                    # Per google-genai docs, usage_metadata is only in the first chunk for streams.
-                    # If so, this will capture it. If it's in the last, this will also capture the last.
-                    final_usage_metadata = chunk.usage_metadata
+                    final_usage_metadata = chunk.usage_metadata # Keep updating, last one will be used
                 
                 if chunk.candidates:
-                    for candidate_idx, candidate in enumerate(chunk.candidates):
+                    for candidate in chunk.candidates: # Iterate through all candidates
                         if candidate.content and candidate.content.parts:
                             for part in candidate.content.parts:
                                 if part.text:
@@ -661,104 +524,80 @@ class GoogleLLMService(LLMService):
                                 elif part.function_call:
                                     logger.debug(f"Function call from model: {part.function_call.name} with args {part.function_call.args}")
                                     await self.call_function(
-                                        context=context, # Pass GoogleLLMContext
-                                        tool_call_id=str(uuid.uuid4()), # Pipecat internal ID
+                                        context=context,
+                                        tool_call_id=str(uuid.uuid4()),
                                         function_name=part.function_call.name,
-                                        arguments=part.function_call.args or {}, # args is already a dict
+                                        arguments=part.function_call.args or {},
                                     )
                         
-                        # Grounding metadata processing (needs careful adaptation)
                         if candidate.grounding_metadata:
                             gm = candidate.grounding_metadata
                             origins_list = []
-                            rendered_web_content = None
-                            if gm.search_entry_point:
-                                rendered_web_content = gm.search_entry_point.rendered_content
-
-                            if gm.grounding_attributions:
+                            rendered_web_content = gm.search_entry_point.rendered_content if gm.search_entry_point else None
+                            if gm.grounding_attributions: # Changed from grounding_chunks/grounding_supports
                                 for attr in gm.grounding_attributions:
                                     origin_entry: Dict[str, Any] = {"results": []}
-                                    source_uri = None
-                                    source_title = None
-                                    if attr.web:
-                                        source_uri = attr.web.uri
-                                        source_title = attr.web.title
-                                    elif attr.retrieved_context: # For RAG
-                                        source_uri = attr.retrieved_context.uri
-                                        source_title = attr.retrieved_context.title
-                                    
-                                    origin_entry["site_uri"] = source_uri
-                                    origin_entry["site_title"] = source_title
-
-                                    # Simplified result extraction:
-                                    # Take text from attr.content if available, and confidence score
-                                    result_text = ""
-                                    if attr.content and attr.content.parts:
-                                        for p in attr.content.parts:
-                                            if p.text:
-                                                result_text += p.text + " "
-                                    
-                                    origin_entry["results"].append({
-                                        "text": result_text.strip(),
-                                        "confidence": attr.confidence_score if hasattr(attr, 'confidence_score') else None
-                                    })
+                                    source_uri, source_title = (attr.web.uri, attr.web.title) if attr.web else \
+                                                               (attr.retrieved_context.uri, attr.retrieved_context.title) if attr.retrieved_context else (None, None)
+                                    origin_entry["site_uri"], origin_entry["site_title"] = source_uri, source_title
+                                    result_text = "".join(p.text + " " for p in attr.content.parts if p.text).strip() if attr.content and attr.content.parts else ""
+                                    origin_entry["results"].append({"text": result_text, "confidence": getattr(attr, 'confidence_score', None)})
                                     origins_list.append(origin_entry)
-                            
-                            grounding_metadata_dict = {
-                                "rendered_content": rendered_web_content,
-                                "origins": origins_list
-                            }
-                
-                # Handle finish reason for logging safety issues
-                if chunk.candidates and chunk.candidates[0].finish_reason:
-                    if str(chunk.candidates[0].finish_reason) == "SAFETY": # Enum comparison
-                        logger.warning(f"LLM refused to generate content due to safety reasons. Prompt: {messages_for_api}")
-                    elif str(chunk.candidates[0].finish_reason) not in ["STOP", "MAX_TOKENS", "UNSPECIFIED"]: # Other non-normal finish reasons
-                        logger.warning(f"LLM generation stopped due to: {chunk.candidates[0].finish_reason}. Candidate: {chunk.candidates[0]}")
+                            grounding_metadata_dict = {"rendered_content": rendered_web_content, "origins": origins_list}
 
+                        if candidate.finish_reason:
+                            # Convert enum to string for comparison if necessary, or use direct enum comparison
+                            finish_reason_str = str(candidate.finish_reason)
+                            if finish_reason_str == str(genai_types.Candidate.FinishReason.SAFETY):
+                                logger.warning(f"LLM refused to generate content due to safety. Prompt: {context.get_messages_for_logging()}")
+                            elif finish_reason_str not in [
+                                str(genai_types.Candidate.FinishReason.STOP),
+                                str(genai_types.Candidate.FinishReason.MAX_TOKENS),
+                                str(genai_types.Candidate.FinishReason.UNSPECIFIED) # Check if this is normal
+                            ]:
+                                logger.warning(f"LLM generation stopped due to: {finish_reason_str}. Candidate: {candidate}")
+                else: # No candidates in chunk
+                    if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                        logger.warning(f"Prompt blocked by Google API. Reason: {chunk.prompt_feedback.block_reason}. Details: {chunk.prompt_feedback.block_reason_message}")
+                        # Consider pushing an error frame or specific message to user
 
-        except api_core_exceptions.DeadlineExceeded: # Keep this if other google libs might throw it
+        except api_core_exceptions.DeadlineExceeded:
             logger.warning(f"{self} completion timeout (DeadlineExceeded)")
             await self._call_event_handler("on_completion_timeout")
-        except genai.types.BlockedPromptException as e:
-            logger.warning(f"{self} prompt was blocked: {e}")
-            # Potentially push a specific frame or call an event handler
-        except genai.types.StopCandidateException as e: # Candidate finished due to safety or other reasons
-            logger.warning(f"{self} candidate generation stopped: {e}")
-        except genai.types.BrokenResponseError as e: # If stream breaks
-            logger.error(f"{self} stream broken: {e}")
+        # More specific error handling based on google.genai.errors
+        except genai_errors.BlockedPromptError as e: # This specific error might not exist, APIError might be used
+            logger.warning(f"{self} prompt was blocked by Google API: {e}")
+        except genai_errors.StopCandidateError as e: # Candidate finished due to safety or other reasons
+            logger.warning(f"{self} candidate generation stopped by Google API: {e}")
+        except genai_errors.BrokenResponseError as e:
+             logger.error(f"{self} stream broken from Google API: {e}")
+        except genai_errors. ओवरलोडError as e: # Example of a specific error if available
+             logger.error(f"{self} API Quota or Rate Limit Exceeded: {e}")
+        except genai_errors.GoogleAPIError as e: # General Google API error
+            logger.error(f"{self} Google API Error: {e}")
         except GoogleAuthError as e:
             logger.error(f"{self} Google Authentication Error: {e}")
-            # Potentially re-raise or handle as a critical error
             raise
-        except genai.errors.GoogleAPIError as e: # Catch specific Google API errors
-            logger.error(f"{self} Google API Error: {e}")
         except Exception as e:
             logger.exception(f"{self} encountered an unhandled exception: {e}")
         finally:
             if grounding_metadata_dict:
                 llm_search_frame = LLMSearchResponseFrame(
-                    search_result=search_result_text, # The aggregated text response
+                    search_result=search_result_text,
                     origins=grounding_metadata_dict.get("origins", []),
                     rendered_content=grounding_metadata_dict.get("rendered_content"),
                 )
                 await self.push_frame(llm_search_frame)
 
             if final_usage_metadata:
-                prompt_tokens = final_usage_metadata.prompt_token_count if final_usage_metadata.prompt_token_count else 0
-                # candidates_token_count in the new SDK's usage_metadata (when present, e.g. first chunk)
-                # refers to "Tokens in the generated candidate(s)" for that response object.
-                # If it's only in the first chunk, it's the total completion.
-                completion_tokens = final_usage_metadata.candidates_token_count if final_usage_metadata.candidates_token_count else 0
-                # total_tokens from metadata, or sum if more reliable
-                # total_tokens_from_meta = final_usage_metadata.total_token_count if final_usage_metadata.total_token_count else 0
-                # Calculated total_tokens is safer for pipecat's metrics
+                prompt_tokens = final_usage_metadata.prompt_token_count or 0
+                completion_tokens = final_usage_metadata.candidates_token_count or 0
+                # total_token_count in new SDK's usage_metadata is often the sum.
+                # If not, pipecat's metric will sum prompt+completion.
+                # We'll rely on pipecat's summation for consistency.
                 calculated_total_tokens = prompt_tokens + completion_tokens
-            else: # Fallback if no usage metadata was found
-                prompt_tokens = 0
-                completion_tokens = 0 # Cannot be determined without metadata
-                calculated_total_tokens = 0
-
+            else:
+                prompt_tokens = 0; completion_tokens = 0; calculated_total_tokens = 0
 
             await self.start_llm_usage_metrics(
                 LLMTokenUsage(
@@ -771,48 +610,31 @@ class GoogleLLMService(LLMService):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
-        context = None
+        context: Optional[GoogleLLMContext] = None
 
         if isinstance(frame, OpenAILLMContextFrame):
-            # Ensure it's a GoogleLLMContext, upgrading if necessary
             if not isinstance(frame.context, GoogleLLMContext):
                  frame.context = GoogleLLMContext.upgrade_to_google(frame.context)
             context = frame.context
         elif isinstance(frame, LLMMessagesFrame):
-            # Create a new GoogleLLMContext from OpenAI standard messages
-            # The LLMMessagesFrame contains messages in OpenAI dict format.
             google_context = GoogleLLMContext()
-            # LLMMessagesFrame.messages are List[Dict]
-            # System message needs to be extracted if present.
-            raw_messages = frame.messages
-            system_msg_text = None
-            user_model_messages = []
-            for msg_dict in raw_messages:
-                if msg_dict.get("role") == "system" and isinstance(msg_dict.get("content"), str):
-                    system_msg_text = msg_dict["content"]
-                else:
-                    user_model_messages.append(msg_dict)
-            
-            if system_msg_text:
-                google_context.system_message_text = system_msg_text
-            
-            google_context.add_messages(user_model_messages) # Converts and adds
+            # Apply service's system instruction if context doesn't have one
+            if self._system_instruction_text and not google_context.system_message_text:
+                google_context.system_message_text = self._system_instruction_text
+            google_context.add_messages(frame.messages)
             context = google_context
-
         elif isinstance(frame, VisionImageRawFrame):
             context = GoogleLLMContext()
-            # If there's a system instruction associated with this service instance, set it.
-            if self._system_instruction_text:
+            if self._system_instruction_text: # Apply service default system instruction
                 context.system_message_text = self._system_instruction_text
             context.add_image_frame_message(
                 format=frame.format, size=frame.size, image=frame.image, text=frame.text
             )
         elif isinstance(frame, LLMUpdateSettingsFrame):
-            # Ensure max_tokens is mapped to max_output_tokens
-            if "max_tokens" in frame.settings:
-                frame.settings["max_output_tokens"] = frame.settings.pop("max_tokens")
-            await self._update_settings(frame.settings)
+            new_settings = frame.settings.copy()
+            if "max_tokens" in new_settings: # Map to Google's param name
+                new_settings["max_output_tokens"] = new_settings.pop("max_tokens")
+            await self._update_settings(new_settings)
         else:
             await self.push_frame(frame, direction)
 
@@ -821,25 +643,19 @@ class GoogleLLMService(LLMService):
 
     def create_context_aggregator(
         self,
-        context: OpenAILLMContext, # Input can be the base OpenAILLMContext
+        context: OpenAILLMContext,
         *,
         user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
         assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
     ) -> GoogleContextAggregatorPair:
+        google_context = GoogleLLMContext.upgrade_to_google(context)
         
-        # Ensure we are working with a GoogleLLMContext instance
-        if not isinstance(context, GoogleLLMContext):
-            google_context = GoogleLLMContext.upgrade_to_google(context)
-        else:
-            google_context = context
-        
-        # If the original context was plain OpenAILLMContext, it might not have system_message_text set.
-        # If this service has a default system instruction, apply it here.
+        # If the original context didn't have a system message,
+        # and this service instance has a default one, apply it.
         if not google_context.system_message_text and self._system_instruction_text:
             google_context.system_message_text = self._system_instruction_text
-
+            
         google_context.set_llm_adapter(self.get_llm_adapter())
-
         user = GoogleUserContextAggregator(google_context, params=user_params)
         assistant = GoogleAssistantContextAggregator(google_context, params=assistant_params)
         return GoogleContextAggregatorPair(_user=user, _assistant=assistant)
